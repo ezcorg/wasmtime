@@ -42,3 +42,11 @@ pub use self::generated::exports;
 
 /// Bindings to the `wasi:http/proxy` world.
 pub use self::generated::{Proxy, ProxyIndices, ProxyPre};
+
+use crate::p3::bindings::http::types::ErrorCode;
+
+impl From<hyper::Error> for ErrorCode {
+    fn from(_: hyper::Error) -> Self {
+        ErrorCode::DestinationUnavailable
+    }
+}
