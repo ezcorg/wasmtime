@@ -3,7 +3,7 @@
 //! This module and its submodules provide host runtime support for Component
 //! Model Async features such as async-lifted exports, async-lowered imports,
 //! streams, futures, and related intrinsics.  See [the Async
-//! Explainer](https://github.com/WebAssembly/component-model/blob/main/design/mvp/Async.md)
+//! Explainer](https://github.com/WebAssembly/component-model/blob/main/design/mvp/Concurrency.md)
 //! for a high-level overview.
 //!
 //! At the core of this support is an event loop which schedules and switches
@@ -242,6 +242,12 @@ where
         self.store
             .as_context_mut()
             .spawn_with_accessor(accessor, task)
+    }
+
+    /// Returns the getter this accessor is using to project from `T` into
+    /// `D::Data`.
+    pub fn getter(&self) -> fn(&mut T) -> D::Data<'_> {
+        self.get_data
     }
 }
 
@@ -2079,7 +2085,8 @@ impl Instance {
             Box::new(move |store, dst| {
                 let mut store = token.as_context_mut(store);
                 assert!(dst.len() <= MAX_FLAT_PARAMS);
-                let mut src = [MaybeUninit::uninit(); MAX_FLAT_PARAMS];
+                // The `+ 1` here accounts for the return pointer, if any:
+                let mut src = [MaybeUninit::uninit(); MAX_FLAT_PARAMS + 1];
                 let count = match caller_info {
                     // Async callers, if they have a result, use the last
                     // parameter as a return pointer so chop that off if
@@ -2906,7 +2913,7 @@ impl Instance {
             .unwrap())
     }
 
-    /// Implements the `thread.new_indirect` intrinsic.
+    /// Implements the `thread.new-indirect` intrinsic.
     pub(crate) fn thread_new_indirect<T: 'static>(
         self,
         mut store: StoreContextMut<T>,
@@ -3475,7 +3482,7 @@ pub trait VMComponentAsyncStore {
         debug_msg_address: u32,
     ) -> Result<()>;
 
-    /// The `thread.new_indirect` intrinsic
+    /// The `thread.new-indirect` intrinsic
     fn thread_new_indirect(
         &mut self,
         instance: Instance,

@@ -10,6 +10,7 @@
 //! When an oracle finds a bug, it should report it to the fuzzing engine by
 //! panicking.
 
+pub mod component_api;
 #[cfg(feature = "fuzz-spec-interpreter")]
 pub mod diff_spec;
 pub mod diff_wasmi;
@@ -21,6 +22,7 @@ mod stacks;
 
 use self::diff_wasmtime::WasmtimeInstance;
 use self::engine::{DiffEngine, DiffInstance};
+use crate::block_on;
 use crate::generators::GcOps;
 use crate::generators::{self, CompilerStrategy, DiffValue, DiffValueType};
 use crate::single_module_fuzzer::KnownValid;
@@ -30,7 +32,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
 use std::sync::{Arc, Condvar, Mutex};
-use std::task::{Context, Poll, Waker};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use wasmtime::*;
 use wasmtime_wast::WastContext;
@@ -59,7 +61,10 @@ pub fn log_wasm(wasm: &[u8]) {
         // If wasmprinter failed remove a `*.wat` file, if any, to avoid
         // confusing a preexisting one with this wasm which failed to get
         // printed.
-        Err(_) => drop(std::fs::remove_file(&wat)),
+        Err(e) => {
+            log::debug!("failed to print to wat: {e}");
+            drop(std::fs::remove_file(&wat))
+        }
     }
 }
 
@@ -1072,98 +1077,6 @@ impl Drop for HelperThread {
     }
 }
 
-/// Generate and execute a `crate::generators::component_types::TestCase` using the specified `input` to create
-/// arbitrary types and values.
-pub fn dynamic_component_api_target(input: &mut arbitrary::Unstructured) -> arbitrary::Result<()> {
-    use crate::generators::component_types;
-    use wasmtime::component::{Component, Linker, Val};
-    use wasmtime_test_util::component::FuncExt;
-    use wasmtime_test_util::component_fuzz::{
-        EXPORT_FUNCTION, IMPORT_FUNCTION, MAX_TYPE_DEPTH, TestCase, Type,
-    };
-
-    crate::init_fuzzing();
-
-    let mut types = Vec::new();
-    let mut type_fuel = 500;
-
-    for _ in 0..5 {
-        types.push(Type::generate(input, MAX_TYPE_DEPTH, &mut type_fuel)?);
-    }
-    let params = (0..input.int_in_range(0..=5)?)
-        .map(|_| input.choose(&types))
-        .collect::<arbitrary::Result<Vec<_>>>()?;
-    let result = if input.arbitrary()? {
-        Some(input.choose(&types)?)
-    } else {
-        None
-    };
-
-    let case = TestCase {
-        params,
-        result,
-        encoding1: input.arbitrary()?,
-        encoding2: input.arbitrary()?,
-    };
-
-    let mut config = wasmtime_test_util::component::config();
-    config.debug_adapter_modules(input.arbitrary()?);
-    let engine = Engine::new(&config).unwrap();
-    let mut store = Store::new(&engine, (Vec::new(), None));
-    let wat = case.declarations().make_component();
-    let wat = wat.as_bytes();
-    log_wasm(wat);
-    let component = Component::new(&engine, wat).unwrap();
-    let mut linker = Linker::new(&engine);
-
-    linker
-        .root()
-        .func_new(IMPORT_FUNCTION, {
-            move |mut cx: StoreContextMut<'_, (Vec<Val>, Option<Vec<Val>>)>,
-                  _,
-                  params: &[Val],
-                  results: &mut [Val]|
-                  -> Result<()> {
-                log::trace!("received params {params:?}");
-                let (expected_args, expected_results) = cx.data_mut();
-                assert_eq!(params.len(), expected_args.len());
-                for (expected, actual) in expected_args.iter().zip(params) {
-                    assert_eq!(expected, actual);
-                }
-                results.clone_from_slice(&expected_results.take().unwrap());
-                log::trace!("returning results {results:?}");
-                Ok(())
-            }
-        })
-        .unwrap();
-
-    let instance = linker.instantiate(&mut store, &component).unwrap();
-    let func = instance.get_func(&mut store, EXPORT_FUNCTION).unwrap();
-    let ty = func.ty(&store);
-
-    while input.arbitrary()? {
-        let params = ty
-            .params()
-            .map(|(_, ty)| component_types::arbitrary_val(&ty, input))
-            .collect::<arbitrary::Result<Vec<_>>>()?;
-        let results = ty
-            .results()
-            .map(|ty| component_types::arbitrary_val(&ty, input))
-            .collect::<arbitrary::Result<Vec<_>>>()?;
-
-        *store.data_mut() = (params.clone(), Some(results.clone()));
-
-        log::trace!("passing params {params:?}");
-        let mut actual = vec![Val::Bool(false); results.len()];
-        func.call_and_post_return(&mut store, &params, &mut actual)
-            .unwrap();
-        log::trace!("received results {actual:?}");
-        assert_eq!(actual, results);
-    }
-
-    Ok(())
-}
-
 /// Instantiates a wasm module and runs its exports with dummy values, all in
 /// an async fashion.
 ///
@@ -1221,7 +1134,7 @@ pub fn call_async(wasm: &[u8], config: &generators::Config, mut poll_amts: &[u32
     // Run the instantiation process, asynchronously, and if everything
     // succeeds then pull out the instance.
     // log::info!("starting instantiation");
-    let instance = run(Timeout {
+    let instance = block_on(Timeout {
         future: Instance::new_async(&mut store, &module, &imports),
         polls: take_poll_amt(&mut poll_amts),
         end: Instant::now() + Duration::from_millis(2_000),
@@ -1267,7 +1180,7 @@ pub fn call_async(wasm: &[u8], config: &generators::Config, mut poll_amts: &[u32
 
         log::info!("invoking export {name:?}");
         let future = func.call_async(&mut store, &params, &mut results);
-        match run(Timeout {
+        match block_on(Timeout {
             future,
             polls: take_poll_amt(&mut poll_amts),
             end: Instant::now() + Duration::from_millis(2_000),
@@ -1353,60 +1266,13 @@ pub fn call_async(wasm: &[u8], config: &generators::Config, mut poll_amts: &[u32
             }
         }
     }
-
-    fn run<F: Future>(future: F) -> F::Output {
-        let mut f = Box::pin(future);
-        let mut cx = Context::from_waker(Waker::noop());
-        loop {
-            match f.as_mut().poll(&mut cx) {
-                Poll::Ready(val) => break val,
-                Poll::Pending => {}
-            }
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arbitrary::Unstructured;
-    use rand::prelude::*;
+    use crate::test::{gen_until_pass, test_n_times};
     use wasmparser::{Validator, WasmFeatures};
-
-    fn gen_until_pass<T: for<'a> Arbitrary<'a>>(
-        mut f: impl FnMut(T, &mut Unstructured<'_>) -> Result<bool>,
-    ) -> bool {
-        let mut rng = SmallRng::seed_from_u64(0);
-        let mut buf = vec![0; 2048];
-        let n = 3000;
-        for _ in 0..n {
-            rng.fill_bytes(&mut buf);
-            let mut u = Unstructured::new(&buf);
-
-            if let Ok(config) = u.arbitrary() {
-                if f(config, &mut u).unwrap() {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-
-    /// Runs `f` with random data until it returns `Ok(())` `iters` times.
-    fn test_n_times<T: for<'a> Arbitrary<'a>>(
-        iters: u32,
-        mut f: impl FnMut(T, &mut Unstructured<'_>) -> arbitrary::Result<()>,
-    ) {
-        let mut to_test = 0..iters;
-        let ok = gen_until_pass(|a, b| {
-            if f(a, b).is_ok() {
-                Ok(to_test.next().is_none())
-            } else {
-                Ok(false)
-            }
-        });
-        assert!(ok);
-    }
 
     // Test that the `gc_ops` fuzzer eventually runs the gc function in the host.
     // We've historically had issues where this fuzzer accidentally wasn't fuzzing
